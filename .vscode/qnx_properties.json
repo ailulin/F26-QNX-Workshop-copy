@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "template": {
+    "projectId": "F26-QNX-Workshop",
+    "artifactName": "F26-QNX-Workshop",
+    "buildType": "SimpleMake",
+    "language": "c",
+    "archlist": "x86_64,aarch64le",
+    "artifactType": "Executable"
+  }
+}
