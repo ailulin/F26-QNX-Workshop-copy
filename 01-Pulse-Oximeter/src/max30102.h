@@ -80,6 +80,9 @@
 #define MAX30102_SAMPLERATE_3200 7
 #define MAX30102_SENSE_BUF_SIZE  30
 
+double MAX30102_monotonicMs(void);
+bool MAX30102_openLogs(void);
+void MAX30102_closeLogs(void);
 bool MAX30102_begin(void);
 void MAX30102_int_test(void);
 bool MAX30102_sensorConfiguration(uint8_t ledBrightness, uint8_t sampleAverage, uint8_t ledMode, uint8_t sampleRate, uint8_t pulseWidth, uint8_t adcRange);

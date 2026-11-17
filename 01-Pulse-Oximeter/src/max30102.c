@@ -13,12 +13,63 @@
  *******************************************************************************/
 
 #include "max30102.h"
+#include "ppg_hr.h"
+#include <time.h>
+#include <stdlib.h>
+#include <math.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/neutrino.h>
 #include <string.h>
 #include <rpi_i2c.h>
 #include <rpi_gpio.h>
+
+static ppg_hr timed_hr;
+static FILE *raw_csv, *measurement_csv;
+static double rate_start, last_receipt, measured_hz;
+static unsigned rate_count, rate_samples, timing_faults;
+static int rate_bad;
+static unsigned clean_samples;
+static double previous_sample;
+
+double MAX30102_monotonicMs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec*1000.0 + ts.tv_nsec/1000000.0;
+}
+
+void MAX30102_closeLogs(void)
+{
+    if (raw_csv) { fclose(raw_csv); raw_csv=NULL; }
+    if (measurement_csv) { fclose(measurement_csv); measurement_csv=NULL; }
+}
+
+bool MAX30102_openLogs(void)
+{
+    const char *raw=getenv("PPG_RAW_CSV"), *result=getenv("PPG_MEASUREMENTS_CSV");
+    if (raw && !(raw_csv=fopen(raw, "w"))) { perror(raw); return false; }
+    if (result && !(measurement_csv=fopen(result, "w"))) {
+        perror(result); MAX30102_closeLogs(); return false;
+    }
+    if (raw_csv) {
+        setvbuf(raw_csv, NULL, _IOFBF, 65536);
+        fprintf(raw_csv, "timestamp_ms,red,ir,batch_size,timing_ok\n");
+    }
+    if (measurement_csv) {
+        setvbuf(measurement_csv, NULL, _IOFBF, 16384);
+        fprintf(measurement_csv, "timestamp_ms,hr,spo2,hr_valid,spo2_valid,peaks,effective_hz,timing_faults\n");
+    }
+    return true;
+}
+
+static void log_error(FILE **file)
+{
+    if (*file && ferror(*file)) {
+        fprintf(stderr, "CSV write failed; disabling affected log\n");
+        fclose(*file); *file=NULL;
+    }
+}
 
 #define min(x,y) ((x) < (y) ? (x) : (y))
 #define FreqS 25 /* Must match effective rate: 100 SPS / avg4 = 25 Hz */
@@ -337,6 +388,9 @@ bool MAX30102_sensorConfiguration(uint8_t ledBrightness, uint8_t sampleAverage, 
 bool MAX30102_waitForInterrupt(void){
     struct _pulse pulse;
     for (;;) {
+        uint64_t timeout_ns=1000000000ULL;
+        if (TimerTimeout(CLOCK_MONOTONIC, _NTO_TIMEOUT_RECEIVE, NULL, &timeout_ns, NULL) == -1)
+            return false;
         if (MsgReceivePulse(chid, &pulse, sizeof(pulse), NULL) == -1){
             perror("MsgReceivePulse()");
             return 0;
@@ -382,11 +436,25 @@ bool MAX30102_getNewData(void) {
         return 0; 
     }
 
+    uint8_t overflow=0;
+    if (!readReg(MAX30102_FIFOOVERFLOW, &overflow, 1)) return false;
+    if (overflow) {
+        timing_faults++;
+        rate_count=0;
+        clean_samples=0;
+        ppg_hr_reset(&timed_hr);
+        MAX30102_resetFIFO();
+        return false;
+    }
     if (readPointer == writePointer) {
         return true; // No data available right now, not a hard failure
     }
 
     int32_t numberOfSamples = (writePointer - readPointer + 32) % 32;
+    /* FIFO has no acquisition clock. Backlogged samples have unknown times. */
+    int timing_ok = numberOfSamples == 1 && overflow == 0;
+    if (!timing_ok) { timing_faults++; ppg_hr_reset(&timed_hr); }
+
     
     for (int s = 0; s < numberOfSamples; s++) {
         uint8_t temp[6] = {0};
@@ -402,6 +470,27 @@ bool MAX30102_getNewData(void) {
             ir_val =((uint32_t)temp[3] << 16) |((uint32_t)temp[4] << 8) | temp[5];
         }
 
+        double receipt = MAX30102_monotonicMs();
+        if (rate_count == 0) { rate_start=receipt; rate_samples=0; }
+        else rate_samples++;
+        rate_count++;
+        last_receipt=receipt;
+        if (receipt-rate_start >= 10000) {
+            measured_hz=1000.0*rate_samples/(receipt-rate_start);
+            rate_bad=fabs(measured_hz-25.0)>1.25;
+            if (rate_bad) fprintf(stderr, "[WARN] Effective rate %.3f Hz; expected 25 Hz\n", measured_hz);
+            rate_count=0;
+        }
+        if (!timing_ok || (previous_sample &&
+            (receipt-previous_sample<20 || receipt-previous_sample>80))) clean_samples=0;
+        else if (clean_samples<100) clean_samples++;
+        previous_sample=receipt;
+        red_val &= 0x3FFFF; ir_val &= 0x3FFFF;
+        ppg_hr_push(&timed_hr, ir_val, receipt, timing_ok && !rate_bad);
+        if (raw_csv) {
+            fprintf(raw_csv, "%.3f,%u,%u,%d,%d\n", receipt, red_val, ir_val, numberOfSamples, timing_ok);
+            log_error(&raw_csv);
+        }
         uint8_t next = (senseBuf.head + 1) % MAX30102_SENSE_BUF_SIZE;
 
         // If software buffer is full, discard oldest sample
@@ -437,7 +526,7 @@ void maxim_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_i
   int32_t n_y_dc_max_idx = 0;
   int32_t n_x_dc_max_idx = 0; 
   int32_t an_ratio[5], n_ratio_average; 
-  int32_t n_nume, n_denom ;
+  int64_t n_nume, n_denom ;
 
   *pn_heart_rate = -999;
   *pch_hr_valid = 0;
@@ -541,11 +630,11 @@ void maxim_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_i
       n_x_ac= (an_x[an_ir_valley_locs[k+1]] - an_x[an_ir_valley_locs[k] ] )*(n_x_dc_max_idx -an_ir_valley_locs[k]); // ir
       n_x_ac=  an_x[an_ir_valley_locs[k]] + n_x_ac/ (an_ir_valley_locs[k+1] - an_ir_valley_locs[k]); 
       n_x_ac=  an_x[n_y_dc_max_idx] - n_x_ac;      // subracting linear DC compoenents from raw 
-      n_nume=( n_y_ac *n_x_dc_max)>>7 ; //prepare X100 to preserve floating value
-      n_denom= ( n_x_ac *n_y_dc_max)>>7;
+      n_nume=( (int64_t)n_y_ac *n_x_dc_max)>>7 ; //prepare X100 to preserve floating value
+      n_denom= ( (int64_t)n_x_ac *n_y_dc_max)>>7;
       if (n_denom>0  && n_i_ratio_count <5 &&  n_nume != 0)
       {   
-        an_ratio[n_i_ratio_count]= (n_nume*100)/n_denom ; //formular is ( n_y_ac *n_x_dc_max) / ( n_x_ac *n_y_dc_max) ;
+        an_ratio[n_i_ratio_count]= (n_nume*100)/n_denom ; //formular is ( (int64_t)n_y_ac *n_x_dc_max) / ( (int64_t)n_x_ac *n_y_dc_max) ;
         n_i_ratio_count++;
       }
     }
@@ -687,6 +776,7 @@ void MAX30102_heartrateAndOxygenSaturation(int32_t *SPO2,int8_t *SPO2Valid,int32
     // Number of samples currently stored
     static int32_t i = 0;
 
+    *SPO2 = *heartRate = -1;
     *SPO2Valid = 0;
     *heartRateValid = 0;
 
@@ -729,12 +819,18 @@ void MAX30102_heartrateAndOxygenSaturation(int32_t *SPO2,int8_t *SPO2Valid,int32
         // Wait for MAX30102 GPIO interrupt
         if (!MAX30102_waitForInterrupt()) {
             i = 0;
+            senseBuf.tail = senseBuf.head;
+            ppg_hr_reset(&timed_hr);
+            clean_samples=0;
             return;
         }
 
         // Read new samples from hardware FIFO
         if (!MAX30102_getNewData()) {
             i = 0;
+            senseBuf.tail = senseBuf.head;
+            ppg_hr_reset(&timed_hr);
+            clean_samples=0;
             return;
         }
     }
@@ -742,4 +838,17 @@ void MAX30102_heartrateAndOxygenSaturation(int32_t *SPO2,int8_t *SPO2Valid,int32
     // Calculate HR and SpO2 from the latest 100 samples
     maxim_heart_rate_and_oxygen_saturation(/**pun_ir_buffer=*/irBuffer, /*n_ir_buffer_length=*/BUFFER_SIZE, /**pun_red_buffer=*/redBuffer, \
       /**pn_spo2=*/SPO2, /**pch_spo2_valid=*/SPO2Valid, /**pn_heart_rate=*/heartRate, /**pch_hr_valid=*/heartRateValid);
+    if (clean_samples<100 || rate_bad) *SPO2Valid=0;
+    unsigned peaks=0;
+    double window_hz=0;
+    *heartRate=ppg_hr_result(&timed_hr, &peaks, &window_hz);
+    *heartRateValid=(*heartRate != -1);
+    if (!*SPO2Valid) *SPO2=-1;
+    if (measurement_csv) {
+        fprintf(measurement_csv, "%.3f,%d,%d,%d,%d,%u,%.3f,%u\n",
+                last_receipt, *heartRate, *SPO2, *heartRateValid, *SPO2Valid,
+                peaks, measured_hz ? measured_hz : window_hz, timing_faults);
+        log_error(&measurement_csv);
+    }
+
 }

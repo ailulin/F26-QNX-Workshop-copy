@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/neutrino.h>
@@ -53,16 +55,30 @@ static int32_t push_average(int32_t *buf, uint8_t *spot, uint8_t *count,
 	return sum / *count;
 }
 
+static volatile sig_atomic_t stopped;
+static void stop_logging(int sig) { (void)sig; stopped=1; }
+
 int main(void)
 {
-	while (!connect_channel()) {
+    if (!MAX30102_openLogs()) return 1;
+    atexit(MAX30102_closeLogs);
+    signal(SIGINT, stop_logging);
+    signal(SIGTERM, stop_logging);
+    const char *duration=getenv("PPG_DURATION_SECONDS");
+    double seconds=duration ? atof(duration) : 0;
+    double started=MAX30102_monotonicMs();
+    bool quiet=getenv("PPG_QUIET") != NULL;
+
+	while (!stopped && !connect_channel()) {
 		usleep(100000);
 	}
 
-	while (!MAX30102_begin()) {
+	if (stopped) return 0;
+	while (!stopped && !MAX30102_begin()) {
 		usleep(100000);
 	}
 
+	if (stopped) return 0;
 	/*
 	 * Match SparkFun Example8_SPO2 setup:
 	 *   brightness=60, avg=4, Red+IR, 100 SPS, pw=411, adcRange=4096
@@ -85,8 +101,9 @@ int main(void)
 		return 1;
 	}
 	fflush(stdout);
+    started=MAX30102_monotonicMs();
 
-	for (;;) {
+	while (!stopped && (seconds<=0 || MAX30102_monotonicMs()-started < seconds*1000)) {
 		int32_t SPO2 = -999;
 		int8_t SPO2Valid = 0;
 		int32_t heartRate = -999;
@@ -104,24 +121,24 @@ int main(void)
 			int32_t avg = push_average(hr_rates, &hr_spot, &hr_count,
 						   heartRate);
 			send_pulse(EVENT_HEARTRATE, avg);
-			printf("HR=%d (avg=%d) ", heartRate, avg);
+			if (!quiet) printf("HR=%d (avg=%d) ", heartRate, avg);
 		} else {
 			hr_count = 0;
 			hr_spot = 0;
 			send_pulse(EVENT_HEARTRATE, -1);
-			printf("HR=-- ");
+			if (!quiet) printf("HR=-- ");
 		}
 
 		if (SPO2Valid) {
 			int32_t avg = push_average(spo2_rates, &spo2_spot,
 						   &spo2_count, SPO2);
 			send_pulse(EVENT_SPO2, avg);
-			printf("SpO2=%d (avg=%d)\n", SPO2, avg);
+			if (!quiet) printf("SpO2=%d (avg=%d)\n", SPO2, avg);
 		} else {
 			spo2_count = 0;
 			spo2_spot = 0;
 			send_pulse(EVENT_SPO2, -1);
-			printf("SpO2=--\n");
+			if (!quiet) printf("SpO2=--\n");
 		}
 		fflush(stdout);
 	}

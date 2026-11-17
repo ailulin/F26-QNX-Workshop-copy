@@ -215,3 +215,23 @@ slay -f alarm-manager
 ## 7. 一句话总结
 
 先修了 `alarm-manager` 的致命逻辑 bug（乱重启、误报、超时算错），再按 **SparkFun / Maxim 参考** 修正 `pulse-oximeter` 的传感器配置与算法有效性门控；告警侧滤波只是辅助，真正消除 250 BPM 一类野值靠的是算法侧的手指检测、峰间距、峰数量、`valid` 标志和生理范围检查。
+
+## 8. Timestamped PPG validation improvements (2026-11-17)
+
+Reviewed and preserved the existing configuration, validity, IPC and alarm fixes.
+Added optional buffered raw/results CSV recording, monotonic receipt timestamps,
+10-second effective-rate diagnostics and optional timed/quiet runs. Added a
+separate continuous 0.1–6 Hz Butterworth HR path with timestamp-based intervals,
+quality/startup gates and up to five intervals. Maxim SpO2 remains on raw Red/IR;
+ratio products use 64-bit arithmetic and timing faults invalidate the window.
+Receive waits now have a one-second timeout to permit shutdown on sensor loss.
+
+Modified: `01-Pulse-Oximeter/src/main.c`, `src/max30102.c`, `src/max30102.h`
+(the latter two under `01-Pulse-Oximeter`), this changelog.
+Added: `01-Pulse-Oximeter/src/ppg_hr.c`, `ppg_hr.h`,
+`tests/test_ppg_hr.c`, `docs/PPG-validation.md`.
+
+Synthetic portable HR tests pass with address/undefined-behavior sanitizers.
+`make build` cannot complete on this host: QNX SDP headers/toolchain unavailable.
+No board tests or accuracy improvement claims. See `docs/PPG-validation.md` for
+pipeline, capture/Jupyter instructions, timestamp limitations and physical tests.
